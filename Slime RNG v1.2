@@ -1,0 +1,210 @@
+-- SERVICES
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+-- INITIAL VARIABLES
+local player = Players.LocalPlayer
+local Character = player.Character or player.CharacterAdded:Wait()
+local hrp = Character:WaitForChild("HumanoidRootPart")
+
+-- SCRIPT 2: OPTIMIZATION (Running first to clear memory)
+-- We wrap this in a task so it doesn't block the rest of the script
+task.spawn(function()
+    RunService:Set3dRenderingEnabled(false) -- Disables 3D view to save CPU
+    Workspace.Gravity = 0
+    Workspace.StreamingEnabled = false
+    
+    local userSettings = UserSettings():GetService("UserGameSettings")
+    userSettings.MasterVolume = 0
+    userSettings.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+    
+    settings().Physics.AllowSleep = true
+    settings().Physics.PhysicsEnvironmentalThrottle = Enum.EnviromentalPhysicsThrottle.Disabled
+
+    -- Clean Lighting
+    Lighting.Brightness = 0
+    Lighting.GlobalShadows = false
+    for _, v in ipairs(Lighting:GetDescendants()) do
+        if v:IsA("PostEffect") or v:IsA("Atmosphere") or v:IsA("Sky") then v:Destroy() end
+    end
+
+    -- Clear Other Players
+    for _, v in ipairs(Players:GetPlayers()) do
+        if v ~= player then v:Destroy() end
+    end
+
+    -- Anti-Lag: Clear workspace but KEEP character and the farm parts
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if child.Name ~= "MRC Scripts" and child.Name ~= "Terrain" and child ~= Character and child.Name ~= "Zones" then
+            child:Destroy()
+        end
+    end
+end)
+
+-- SCRIPT 1: AUTO-FARM LOGIC
+local Packages = ReplicatedStorage:WaitForChild("Packages")
+local Source = ReplicatedStorage:WaitForChild("Source")
+local _Index = Packages._Index
+local Features = Source.Features
+local Zones = require(Source.Game.Items.Zones)
+local IndexRewards = require(Features.Index.IndexRewards)
+local RollSlice = require(Features.Roll.RollSlice)
+
+local Upgrades = Features.Upgrades
+local UpgradeTree = require(Upgrades.UpgradeTree)
+local UpgradeServiceUtils = require(Upgrades.UpgradeServiceUtils)
+
+local leifstout_networker = _Index["leifstout_networker@0.3.1"]
+local networker = leifstout_networker.networker
+local _remotes = networker._remotes
+local RollService = _remotes.RollService
+local UpgradeService = _remotes.UpgradeService
+local LootService = _remotes.LootService
+local ZonesService = _remotes.ZonesService
+local InventoryService = _remotes.InventoryService
+local IndexService = _remotes.IndexService
+local RebirthService = _remotes.RebirthService
+
+-- User Data & UI Setup
+local TotalRolls = 0
+local client = require(Packages.DataService).client
+local zonesTable = {}
+local unlockedUpgrades = client:get("upgrades")
+
+-- Safe Platform Setup
+local SafePart = Instance.new("Part", Workspace)
+SafePart.Name = "MRCScripts"
+SafePart.Size = Vector3.new(10, 1, 10)
+SafePart.Position = hrp.Position - Vector3.new(0, 3, 0)
+SafePart.Anchored = true
+
+-- FUNCTIONS
+local function load(url, file)
+    local folder = "MRC-Utils"
+    local path = folder .. "/" .. file
+    if not isfolder(folder) then makefolder(folder) end
+    local success, response = pcall(function()
+        return request({Url = url, Method = "GET"})
+    end)
+    if success and response.StatusCode == 200 then
+        writefile(path, response.Body)
+        return loadstring(response.Body)()
+    elseif isfile(path) then
+        return loadstring(readfile(path))()
+    end
+end
+
+local utils = load("https://raw.githubusercontent.com/sakahr315/Lib/refs/heads/main/utils", "Utils.lua")
+local lib = load("https://raw.githubusercontent.com/sakahr315/Lib/refs/heads/main/Lib.lua", "Lib.lua")
+
+-- UI Stat Window
+local Window = lib:CreateWindow("MRC Slime RNG", true)
+local StatusStat = Window:AddStat("Status", "Idling")
+local TimeEclapsedStat = Window:AddStat("Time Farmed", "00:00:00")
+Window:AddSeperator()
+local CoinsStat = Window:AddStat("Coins", 0)
+local RollsStat = Window:AddStat("Rolls", "0/0")
+local ZoneStat = Window:AddStat("Zone")
+local RebirthStat = Window:AddStat("Rebirths",0)
+local LuckStat = Window:AddStat("Luck",0)
+
+local startTime = os.clock()
+
+local function TeleportPlayer(cf)
+    if typeof(cf) == "Vector3" then cf = CFrame.new(cf) end
+    hrp.CFrame = cf
+    SafePart.CFrame = cf * CFrame.new(0, -3, 0)
+end
+
+-- Collect Zone Data
+for _, zone in ipairs(Workspace:WaitForChild("Zones"):GetChildren()) do
+    if zone:FindFirstChild("POI") and zone.POI:FindFirstChild("Baseplate") then
+        zonesTable[tonumber(zone.Name)] = zone.POI.Baseplate.Position + Vector3.new(0, 10, 0)
+    end
+end
+
+-- AUTO-COLLECT LOOT
+LootService.RemoteEvent.OnClientEvent:Connect(function(type, data)
+    if type == "lootAdded" then
+        LootService.RemoteFunction:InvokeServer("requestCollect", data.uniqueId)
+    end
+end)
+
+-- LOOP 1: AUTO ROLL
+task.spawn(function()
+    while task.wait(0.1) do
+        task.spawn(function()
+            local success = RollService.RemoteFunction:InvokeServer("requestRoll")
+            if success then TotalRolls += 1 end
+        end)
+    end
+end)
+
+-- LOOP 2: UPGRADES / REBIRTH / CLAIM
+task.spawn(function()
+    while task.wait(5) do
+        -- Upgrade Logic
+        for treeName, treeGroup in pairs(UpgradeTree) do
+            for id, data in pairs(treeGroup) do
+                if not unlockedUpgrades[id] and data.cost and client:get(data.cost.currency) >= data.cost.amount then
+                    UpgradeService.RemoteFunction:InvokeServer("requestUnlock", id)
+                    unlockedUpgrades = client:get("upgrades")
+                end
+            end
+        end
+        InventoryService.RemoteFunction:InvokeServer("requestEquipBest")
+        
+        -- Rebirth Logic
+        local cost = 2 ^ math.max(math.floor(client:get("rebirths") or 0), 0) * 500
+        if client:get("goop") >= cost then
+            RebirthService.RemoteFunction:InvokeServer("requestRebirth")
+        end
+    end
+end)
+
+-- LOOP 3: ZONE PROGRESSION
+task.spawn(function()
+    while task.wait(1) do
+        local currentZone = math.max(client:get("maxZone") or 1, 1)
+        local nextZoneData = Zones.getZone(currentZone + 1)
+        if nextZoneData and client:get("coins") >= nextZoneData.price then
+            ZonesService.RemoteFunction:InvokeServer("requestPurchaseZone")
+        end
+        
+        if zonesTable[currentZone] then
+            TeleportPlayer(zonesTable[currentZone])
+        end
+    end
+end)
+
+-- LOOP 4: UI UPDATES
+task.spawn(function()
+    while task.wait(1) do
+        TimeEclapsedStat:Update(tostring(utils:FormatTime(os.clock() - startTime)))
+        CoinsStat:Update(utils:FormatNumber(client:get("coins")))
+        RollsStat:Update(TotalRolls)
+        ZoneStat:Update(math.max(client:get("maxZone") or 1, 1))
+        RebirthStat:Update(client:get("rebirths") or 0)
+        LuckStat:Update(utils:FormatNumber(RollSlice.luck))
+    end
+end)
+
+
+-- Simple Roblox Anti-AFK
+-- Prevents idle kick by simulating movement
+
+local VirtualUser = game:GetService("VirtualUser")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
+
+print("Anti-AFK Enabled")
